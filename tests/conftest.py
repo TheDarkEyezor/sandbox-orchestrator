@@ -58,10 +58,11 @@ def mock_docker(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def reset_state():
-    """Clear the in-memory deque and truncate the log between tests."""
+    """Clear the in-memory deque + sandbox registry and truncate the log."""
     import app
 
     app.job_queue.clear()
+    app.sandboxes.clear()
     _LOG_PATH.write_text("")
     yield
 

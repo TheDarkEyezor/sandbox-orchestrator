@@ -3,9 +3,9 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
 import docker
@@ -102,8 +102,32 @@ class Job(BaseModel):
         return v
 
 
+STATUS_QUEUED = "queued"
+STATUS_STARTING = "starting"
+STATUS_READY = "ready"
+STATUS_FAILED = "failed"
+ALL_STATUSES = (STATUS_QUEUED, STATUS_STARTING, STATUS_READY, STATUS_FAILED)
+
+
+@dataclass
+class SandboxRecord:
+    jobId: str
+    type: str
+    status: str
+    enqueuedAt: str
+    containerId: str | None = None
+    url: str | None = None
+    readyAt: str | None = None
+    error: str | None = None
+
+
 job_queue: deque[Job] = deque()
+sandboxes: dict[str, SandboxRecord] = {}
 docker_client: docker.DockerClient | None = None
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def worker_loop() -> None:
@@ -113,10 +137,16 @@ async def worker_loop() -> None:
             await asyncio.sleep(0.1)
             continue
         job = job_queue.popleft()
+        record = sandboxes[job.jobId]
+        record.status = STATUS_STARTING
         emit("sandbox_starting", jobId=job.jobId, type=job.type)
         builder = BUILDERS[job.type]
         try:
             info = await asyncio.to_thread(builder.build, job, docker_client)
+            record.status = STATUS_READY
+            record.containerId = info.container_id
+            record.url = info.url
+            record.readyAt = _now()
             emit(
                 "sandbox_ready",
                 jobId=job.jobId,
@@ -125,11 +155,14 @@ async def worker_loop() -> None:
                 url=info.url,
             )
         except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            record.status = STATUS_FAILED
+            record.error = err
             emit(
                 "sandbox_failed",
                 jobId=job.jobId,
                 type=job.type,
-                error=f"{type(e).__name__}: {e}",
+                error=err,
             )
 
 
@@ -155,9 +188,31 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/jobs", status_code=202)
 async def submit_job(job: Job) -> dict:
+    sandboxes[job.jobId] = SandboxRecord(
+        jobId=job.jobId,
+        type=job.type,
+        status=STATUS_QUEUED,
+        enqueuedAt=_now(),
+    )
     job_queue.append(job)
     emit("job_enqueued", jobId=job.jobId, type=job.type)
     return {"jobId": job.jobId, "queued": True, "queueDepth": len(job_queue)}
+
+
+@app.get("/sandboxes")
+async def list_sandboxes() -> dict:
+    records = list(sandboxes.values())
+    status_counts = Counter(r.status for r in records)
+    return {
+        "counts": {
+            "running": dict(
+                Counter(r.type for r in records if r.status == STATUS_READY)
+            ),
+            "byStatus": {s: status_counts.get(s, 0) for s in ALL_STATUSES},
+            "total": len(records),
+        },
+        "sandboxes": [asdict(r) for r in records],
+    }
 
 
 @app.get("/healthz")

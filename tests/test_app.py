@@ -176,6 +176,60 @@ class TestBrowserSandbox:
         assert by_name["b1"].startswith("browserless/chrome")
 
 
+class TestSandboxView:
+    def test_get_sandboxes_empty_initially(self, client):
+        r = client.get("/sandboxes")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["counts"]["total"] == 0
+        assert body["counts"]["running"] == {}
+        assert body["sandboxes"] == []
+        # All status buckets present even when zero, so callers don't have to defend.
+        assert set(body["counts"]["byStatus"]) == {
+            "queued",
+            "starting",
+            "ready",
+            "failed",
+        }
+
+    def test_get_sandboxes_lists_running_with_per_type_counts(
+        self, client, mock_docker
+    ):
+        for jid, jt in [("h1", "http"), ("h2", "http"), ("b1", "browser")]:
+            client.post("/jobs", json={"jobId": jid, "type": jt})
+        for jid in ("h1", "h2", "b1"):
+            wait_for_event("sandbox_ready", jobId=jid)
+
+        body = client.get("/sandboxes").json()
+        assert body["counts"]["total"] == 3
+        assert body["counts"]["running"] == {"http": 2, "browser": 1}
+        assert body["counts"]["byStatus"]["ready"] == 3
+
+        records = {r["jobId"]: r for r in body["sandboxes"]}
+        assert records["h1"]["status"] == "ready"
+        assert records["h1"]["containerId"] == "cid-h1"
+        assert records["h1"]["url"].startswith("http://")
+        assert records["b1"]["url"].startswith("ws://")
+        # Lifecycle timestamps populated on success.
+        assert records["h1"]["enqueuedAt"] is not None
+        assert records["h1"]["readyAt"] is not None
+
+    def test_failed_sandbox_appears_with_failed_status_not_running(
+        self, client, mock_docker
+    ):
+        mock_docker.containers.run.side_effect = RuntimeError("boom")
+        client.post("/jobs", json={"jobId": "doom", "type": "http"})
+        wait_for_event("sandbox_failed", jobId="doom")
+
+        body = client.get("/sandboxes").json()
+        doom = next(r for r in body["sandboxes"] if r["jobId"] == "doom")
+        assert doom["status"] == "failed"
+        assert "boom" in doom["error"]
+        assert body["counts"]["byStatus"]["failed"] == 1
+        # 'failed' must not count as running.
+        assert body["counts"]["running"].get("http", 0) == 0
+
+
 class TestHealthz:
     def test_healthz_reports_registered_sandbox_types(self, client):
         r = client.get("/healthz")
