@@ -34,12 +34,16 @@ def mock_docker(monkeypatch):
 
     def fake_run(image, *, detach, name, ports, labels, **_):
         port_counter["n"] += 1
+        # The builder asks for a specific container port (e.g., "80/tcp",
+        # "3000/tcp"); echo that back in the attrs so each builder's port
+        # discovery works regardless of type.
+        container_port = next(iter(ports))
         container = MagicMock(name=f"container_{name}")
         container.id = f"cid-{name}"
         container.attrs = {
             "NetworkSettings": {
                 "Ports": {
-                    "80/tcp": [
+                    container_port: [
                         {"HostIp": "0.0.0.0", "HostPort": str(port_counter["n"])}
                     ]
                 }

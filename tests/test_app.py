@@ -146,10 +146,40 @@ class TestLogFile:
         assert ready["url"].startswith("http://localhost:")
 
 
+class TestBrowserSandbox:
+    def test_browser_job_uses_browserless_image_and_ws_url(self, client, mock_docker):
+        r = client.post("/jobs", json={"jobId": "brws", "type": "browser"})
+        assert r.status_code == 202
+
+        ready = wait_for_event("sandbox_ready", jobId="brws")
+        assert ready["type"] == "browser"
+        assert ready["url"].startswith("ws://localhost:")
+
+        call = mock_docker.containers.run.call_args
+        assert call.args[0].startswith("browserless/chrome")
+        assert "3000/tcp" in call.kwargs["ports"]
+        assert call.kwargs["name"] == "brws"
+        assert call.kwargs["labels"]["sandbox.type"] == "browser"
+
+    def test_browser_and_http_can_coexist(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "h1", "type": "http"})
+        client.post("/jobs", json={"jobId": "b1", "type": "browser"})
+
+        wait_for_event("sandbox_ready", jobId="h1")
+        wait_for_event("sandbox_ready", jobId="b1")
+
+        by_name = {
+            c.kwargs["name"]: c.args[0]
+            for c in mock_docker.containers.run.call_args_list
+        }
+        assert by_name["h1"] == "nginx:alpine"
+        assert by_name["b1"].startswith("browserless/chrome")
+
+
 class TestHealthz:
     def test_healthz_reports_registered_sandbox_types(self, client):
         r = client.get("/healthz")
         assert r.status_code == 200
         body = r.json()
-        assert "http" in body["sandboxTypes"]
+        assert set(body["sandboxTypes"]) == {"http", "browser"}
         assert body["queueDepth"] == 0

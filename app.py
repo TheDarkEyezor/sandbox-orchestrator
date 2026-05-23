@@ -62,8 +62,29 @@ class HttpSandbox(SandboxBuilder):
         )
 
 
+class BrowserSandbox(SandboxBuilder):
+    image = "browserless/chrome:latest"
+    container_port = "3000/tcp"  # CDP-over-WebSocket endpoint
+
+    def build(self, job: "Job", client: docker.DockerClient) -> ContainerInfo:
+        container = client.containers.run(
+            self.image,
+            detach=True,
+            name=job.jobId,
+            ports={self.container_port: None},
+            labels={"sandbox.jobId": job.jobId, "sandbox.type": job.type},
+        )
+        container.reload()
+        host_port = container.attrs["NetworkSettings"]["Ports"][self.container_port][0]["HostPort"]
+        return ContainerInfo(
+            container_id=container.id,
+            url=f"ws://localhost:{host_port}",
+        )
+
+
 BUILDERS: dict[str, SandboxBuilder] = {
     "http": HttpSandbox(),
+    "browser": BrowserSandbox(),
 }
 
 
