@@ -38,36 +38,3 @@ We're going to build a lightweight sandbox orchestration platform. AI agents at 
     **Failure and lifecycle**
 
     Handle sandbox failures and add a cleanup mechanism so sandboxes don't run forever (TTL, idle timeout, or explicit release).
-
-## Implementation
-
-Python
-
-### step 1
-
-Deque
-{
-  "jobID": ____, // string
-  "type": ____ // string
-}
-Write to log file
-
-### Step 2
-
-FastAPI python webapp
-Log new container URL onto the log file
-
-### Step 3
-
-docker pull linuxserver/chrome:148.0.7778
-
-### Step 4
-
-A dict in ram, keeping track of number of sandboxes for each sandbox type
-set of currently sandboxes
-
-### Step 5
-
-# To be addressed
-
-- [] Make jobTypes enum (only "http" or "browser")
