@@ -24,19 +24,23 @@ def log_path() -> Path:
 
 @pytest.fixture
 def mock_docker(monkeypatch):
-    """Replace docker.from_env with a MagicMock recording all run() calls."""
+    """Replace docker.from_env with a MagicMock recording all run() calls.
+
+    Containers created via run() are also retrievable via get() and have a
+    no-op stats() returning zero network bytes by default. Tests can mutate
+    a container's stats.return_value to simulate traffic.
+    """
     import docker
+    from docker.errors import NotFound
 
     client = MagicMock(name="docker_client")
     client.ping.return_value = True
 
     port_counter = {"n": 49999}
+    containers_by_id: dict[str, MagicMock] = {}
 
     def fake_run(image, *, detach, name, ports, labels, **_):
         port_counter["n"] += 1
-        # The builder asks for a specific container port (e.g., "80/tcp",
-        # "3000/tcp"); echo that back in the attrs so each builder's port
-        # discovery works regardless of type.
         container_port = next(iter(ports))
         container = MagicMock(name=f"container_{name}")
         container.id = f"cid-{name}"
@@ -49,9 +53,19 @@ def mock_docker(monkeypatch):
                 }
             }
         }
+        container.stats.return_value = {
+            "networks": {"eth0": {"rx_bytes": 0, "tx_bytes": 0}}
+        }
+        containers_by_id[container.id] = container
         return container
 
+    def fake_get(container_id):
+        if container_id in containers_by_id:
+            return containers_by_id[container_id]
+        raise NotFound(f"no such container: {container_id}")
+
     client.containers.run.side_effect = fake_run
+    client.containers.get.side_effect = fake_get
     monkeypatch.setattr(docker, "from_env", lambda: client)
     return client
 

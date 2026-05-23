@@ -6,8 +6,10 @@ Covers:
 - Producer-level rejections (missing/empty fields, unknown type) return 422.
 - Worker survives builder exceptions and keeps draining the queue.
 - The log file contains the expected event sequence per job.
+- Lifecycle: TTL expiry, idle-via-network-stats, manual DELETE, jobId reuse.
 """
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -235,6 +237,7 @@ class TestSandboxView:
             "starting",
             "ready",
             "failed",
+            "terminated",
         }
 
     def test_get_sandboxes_lists_running_with_per_type_counts(
@@ -273,6 +276,183 @@ class TestSandboxView:
         assert body["counts"]["byStatus"]["failed"] == 1
         # 'failed' must not count as running.
         assert body["counts"]["running"].get("http", 0) == 0
+
+
+class TestLifecycleTTL:
+    def test_ttl_expired_terminates_sandbox(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "ephemeral", "type": "http", "ttlSeconds": 10})
+        ready = wait_for_event("sandbox_ready", jobId="ephemeral")
+
+        import app
+
+        ready_at = datetime.fromisoformat(ready["ts"])
+        app._run_reaper_pass(now=ready_at + timedelta(seconds=11))
+
+        term = wait_for_event("sandbox_terminated", jobId="ephemeral")
+        assert term["reason"] == "ttl_expired"
+        rec = app.sandboxes["ephemeral"]
+        assert rec.status == "terminated"
+        assert rec.terminationReason == "ttl_expired"
+
+    def test_ttl_not_yet_expired_leaves_sandbox_running(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "young", "type": "http", "ttlSeconds": 60})
+        ready = wait_for_event("sandbox_ready", jobId="young")
+
+        import app
+
+        ready_at = datetime.fromisoformat(ready["ts"])
+        app._run_reaper_pass(now=ready_at + timedelta(seconds=5))
+
+        assert app.sandboxes["young"].status == "ready"
+
+    def test_default_ttl_used_when_not_specified(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "default", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="default")
+
+        import app
+
+        assert app.sandboxes["default"].ttlSeconds == app.DEFAULT_TTL_SECONDS
+
+
+class TestLifecycleIdle:
+    def test_idle_sandbox_terminated_when_no_network_traffic(
+        self, client, mock_docker
+    ):
+        client.post("/jobs", json={"jobId": "lonely", "type": "http", "ttlSeconds": 3600})
+        wait_for_event("sandbox_ready", jobId="lonely")
+
+        import app
+
+        # stats() defaults to 0 bytes; jump past idle threshold.
+        future = datetime.now(timezone.utc) + timedelta(
+            seconds=app.IDLE_TIMEOUT_SECONDS + 1
+        )
+        app._run_reaper_pass(now=future)
+
+        term = wait_for_event("sandbox_terminated", jobId="lonely")
+        assert term["reason"] == "idle_timeout"
+
+    def test_network_traffic_resets_idle_timer(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "busy", "type": "http", "ttlSeconds": 3600})
+        wait_for_event("sandbox_ready", jobId="busy")
+
+        import app
+
+        # Simulate traffic: bump stats before the reaper pass.
+        container = mock_docker.containers.get("cid-busy")
+        container.stats.return_value = {
+            "networks": {"eth0": {"rx_bytes": 5000, "tx_bytes": 5000}}
+        }
+        # Even past the idle window, observing growth should *not* terminate.
+        future = datetime.now(timezone.utc) + timedelta(
+            seconds=app.IDLE_TIMEOUT_SECONDS + 1
+        )
+        app._run_reaper_pass(now=future)
+
+        assert app.sandboxes["busy"].status == "ready"
+        assert app.sandboxes["busy"].lastNetworkBytes == 10000
+
+    def test_idle_pass_records_external_container_disappearance(
+        self, client, mock_docker
+    ):
+        client.post("/jobs", json={"jobId": "ghost", "type": "http", "ttlSeconds": 3600})
+        wait_for_event("sandbox_ready", jobId="ghost")
+
+        import app
+        from docker.errors import NotFound
+
+        # Container vanishes externally (e.g., killed via docker CLI).
+        mock_docker.containers.get.side_effect = NotFound("gone")
+        app._run_reaper_pass()
+
+        term = wait_for_event("sandbox_terminated", jobId="ghost")
+        assert term["reason"] == "container_missing"
+
+
+class TestKillEndpoint:
+    def test_delete_running_sandbox_terminates_it(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "byebye", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="byebye")
+
+        r = client.delete("/jobs/byebye")
+        assert r.status_code == 200
+        assert r.json()["reason"] == "manual"
+
+        # container.remove was called with force=True.
+        container = mock_docker.containers.get("cid-byebye")
+        container.remove.assert_called_with(force=True)
+
+        term = wait_for_event("sandbox_terminated", jobId="byebye")
+        assert term["reason"] == "manual"
+
+    def test_delete_queued_job_removes_it_before_worker_picks_up(
+        self, client, mock_docker
+    ):
+        import app
+        import threading
+
+        # Block the first containers.run() so the worker is mid-build on
+        # 'first' while we delete 'second' from the queue.
+        gate = threading.Event()
+        real_run = mock_docker.containers.run.side_effect
+
+        def blocking_run(*args, **kwargs):
+            gate.wait(timeout=3)
+            return real_run(*args, **kwargs)
+
+        mock_docker.containers.run.side_effect = blocking_run
+
+        client.post("/jobs", json={"jobId": "first", "type": "http"})
+        client.post("/jobs", json={"jobId": "second", "type": "http"})
+        # Either both are queued or 'first' is starting and 'second' is
+        # queued — either way 'second' should not yet be ready.
+        assert app.sandboxes["second"].status in {"queued", "starting"}
+
+        r = client.delete("/jobs/second")
+        assert r.status_code == 200
+        assert app.sandboxes["second"].status == "terminated"
+
+        gate.set()
+        wait_for_event("sandbox_ready", jobId="first")
+        # 'second' was removed from the queue before the worker reached it.
+        names = [c.kwargs["name"] for c in mock_docker.containers.run.call_args_list]
+        assert "second" not in names
+
+    def test_delete_unknown_jobId_returns_404(self, client):
+        r = client.delete("/jobs/nonexistent")
+        assert r.status_code == 404
+
+    def test_delete_already_terminated_returns_409(self, client, mock_docker):
+        client.post("/jobs", json={"jobId": "twice", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="twice")
+        assert client.delete("/jobs/twice").status_code == 200
+        # Second delete should fail.
+        r2 = client.delete("/jobs/twice")
+        assert r2.status_code == 409
+
+    def test_terminated_jobId_can_be_reused(self, client, mock_docker):
+        import app
+
+        client.post("/jobs", json={"jobId": "recycle", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="recycle")
+        client.delete("/jobs/recycle")
+        assert app.sandboxes["recycle"].status == "terminated"
+
+        # Submitting the same jobId again now succeeds.
+        r = client.post("/jobs", json={"jobId": "recycle", "type": "http"})
+        assert r.status_code == 202
+
+        # Poll the record itself (the log already has a sandbox_ready event
+        # from the first sandbox, so wait_for_event would match prematurely).
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if app.sandboxes["recycle"].status == "ready":
+                break
+            time.sleep(0.05)
+        assert app.sandboxes["recycle"].status == "ready"
+
+        names = [c.kwargs["name"] for c in mock_docker.containers.run.call_args_list]
+        assert names.count("recycle") == 2
 
 
 class TestHealthz:
