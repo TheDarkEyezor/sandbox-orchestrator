@@ -176,6 +176,51 @@ class TestBrowserSandbox:
         assert by_name["b1"].startswith("browserless/chrome")
 
 
+class TestDuplicateJobId:
+    def test_duplicate_jobId_returns_409(self, client, mock_docker):
+        r1 = client.post("/jobs", json={"jobId": "dup", "type": "http"})
+        assert r1.status_code == 202
+        wait_for_event("sandbox_ready", jobId="dup")
+
+        r2 = client.post("/jobs", json={"jobId": "dup", "type": "http"})
+        assert r2.status_code == 409
+        assert "dup" in r2.text
+
+    def test_duplicate_jobId_does_not_create_second_container(
+        self, client, mock_docker
+    ):
+        client.post("/jobs", json={"jobId": "once", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="once")
+        first_count = mock_docker.containers.run.call_count
+
+        client.post("/jobs", json={"jobId": "once", "type": "http"})
+        # Give the worker time to (incorrectly) act if dedup were broken.
+        time.sleep(0.3)
+
+        assert mock_docker.containers.run.call_count == first_count
+
+    def test_duplicate_jobId_caught_before_record_overwrite(
+        self, client, mock_docker
+    ):
+        # First request succeeds and writes containerId/url to the record.
+        client.post("/jobs", json={"jobId": "keep", "type": "http"})
+        wait_for_event("sandbox_ready", jobId="keep")
+
+        first = next(
+            r for r in client.get("/sandboxes").json()["sandboxes"]
+            if r["jobId"] == "keep"
+        )
+        assert first["containerId"] == "cid-keep"
+
+        # Duplicate is rejected; the original record is untouched.
+        client.post("/jobs", json={"jobId": "keep", "type": "http"})
+        after = next(
+            r for r in client.get("/sandboxes").json()["sandboxes"]
+            if r["jobId"] == "keep"
+        )
+        assert after == first
+
+
 class TestSandboxView:
     def test_get_sandboxes_empty_initially(self, client):
         r = client.get("/sandboxes")

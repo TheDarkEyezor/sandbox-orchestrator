@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
 import docker
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 LOG_PATH = os.environ.get("SANDBOX_LOG_PATH", "sandbox.log")
@@ -188,6 +188,12 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/jobs", status_code=202)
 async def submit_job(job: Job) -> dict:
+    existing = sandboxes.get(job.jobId)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"jobId {job.jobId!r} already exists with status {existing.status!r}",
+        )
     sandboxes[job.jobId] = SandboxRecord(
         jobId=job.jobId,
         type=job.type,
