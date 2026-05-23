@@ -1,16 +1,18 @@
 import asyncio
 import json
 import logging
+import os
+from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
 
 import docker
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-LOG_PATH = "sandbox.log"
+LOG_PATH = os.environ.get("SANDBOX_LOG_PATH", "sandbox.log")
 
 _log = logging.getLogger("sandbox")
 _log.setLevel(logging.INFO)
@@ -24,41 +26,63 @@ def emit(event: str, **fields) -> None:
     _log.info(json.dumps(record))
 
 
+@dataclass
+class ContainerInfo:
+    container_id: str
+    url: str
+
+
+class SandboxBuilder(ABC):
+    """Each subclass encapsulates the image, port mapping, and any per-type
+    setup needed to bring a sandbox online. build() runs in a worker thread."""
+
+    image: str
+
+    @abstractmethod
+    def build(self, job: "Job", client: docker.DockerClient) -> ContainerInfo: ...
+
+
+class HttpSandbox(SandboxBuilder):
+    image = "nginx:alpine"
+    container_port = "80/tcp"
+
+    def build(self, job: "Job", client: docker.DockerClient) -> ContainerInfo:
+        container = client.containers.run(
+            self.image,
+            detach=True,
+            name=job.jobId,
+            ports={self.container_port: None},
+            labels={"sandbox.jobId": job.jobId, "sandbox.type": job.type},
+        )
+        container.reload()
+        host_port = container.attrs["NetworkSettings"]["Ports"][self.container_port][0]["HostPort"]
+        return ContainerInfo(
+            container_id=container.id,
+            url=f"http://localhost:{host_port}",
+        )
+
+
+BUILDERS: dict[str, SandboxBuilder] = {
+    "http": HttpSandbox(),
+}
+
+
 class Job(BaseModel):
     jobId: str = Field(..., min_length=1)
     type: str = Field(..., min_length=1)
 
+    @field_validator("type")
+    @classmethod
+    def known_type(cls, v: str) -> str:
+        if v not in BUILDERS:
+            raise ValueError(
+                f"unknown sandbox type {v!r}; known: {sorted(BUILDERS)}"
+            )
+        return v
+
 
 job_queue: deque[Job] = deque()
 docker_client: docker.DockerClient | None = None
-
-
-async def spawn_http(job: Job) -> None:
-    def _run():
-        container = docker_client.containers.run(
-            "nginx:alpine",
-            detach=True,
-            ports={"80/tcp": None},
-            labels={"sandbox.jobId": job.jobId, "sandbox.type": job.type},
-        )
-        container.reload()
-        host_port = container.attrs["NetworkSettings"]["Ports"]["80/tcp"][0]["HostPort"]
-        return container.id, host_port
-
-    container_id, host_port = await asyncio.to_thread(_run)
-    url = f"http://localhost:{host_port}"
-    emit(
-        "sandbox_ready",
-        jobId=job.jobId,
-        type=job.type,
-        containerId=container_id,
-        url=url,
-    )
-
-
-HANDLERS: dict[str, Callable[[Job], Awaitable[None]]] = {
-    "http": spawn_http,
-}
 
 
 async def worker_loop() -> None:
@@ -69,17 +93,16 @@ async def worker_loop() -> None:
             continue
         job = job_queue.popleft()
         emit("sandbox_starting", jobId=job.jobId, type=job.type)
-        handler = HANDLERS.get(job.type)
-        if handler is None:
+        builder = BUILDERS[job.type]
+        try:
+            info = await asyncio.to_thread(builder.build, job, docker_client)
             emit(
-                "sandbox_failed",
+                "sandbox_ready",
                 jobId=job.jobId,
                 type=job.type,
-                error=f"unknown job type: {job.type}",
+                containerId=info.container_id,
+                url=info.url,
             )
-            continue
-        try:
-            await handler(job)
         except Exception as e:
             emit(
                 "sandbox_failed",
@@ -118,4 +141,4 @@ async def submit_job(job: Job) -> dict:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"queueDepth": len(job_queue), "handlers": list(HANDLERS.keys())}
+    return {"queueDepth": len(job_queue), "sandboxTypes": sorted(BUILDERS.keys())}
